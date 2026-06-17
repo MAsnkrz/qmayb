@@ -37,7 +37,7 @@ BRAND_URL       = "https://www.qogita.com/brands/maybelline/"
 SNAPSHOT_FILE   = "snapshot_qogita.json"
 REQUEST_DELAY   = 1.0   # seconds between API calls (be polite)
 RUN_ONCE        = os.getenv("RUN_ONCE", "false").lower() == "true"
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "900"))  # 30 min
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 min
 
 QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "")
 QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "")
