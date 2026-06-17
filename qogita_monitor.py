@@ -1,18 +1,21 @@
 """
-Qogita Maybelline Monitor
-Monitors https://www.qogita.com/brands/maybelline/
+Qogita Maybelline Monitor — API-based
+Uses the Qogita internal API (https://api.qogita.com) instead of browser scraping.
 
-Tracks per product:
-  - Lowest unit price across all suppliers
-  - Total stock available
+Workflow:
+  1. Authenticate via POST /auth/login/ to get a JWT token
+  2. Fetch all Maybelline variants via GET /variants/?brand_slug=maybelline
+  3. For each variant, fetch offers via GET /variants/{qid}/offers/
+  4. Pick the lowest unit price offer
+  5. Compare against snapshot and fire Discord alerts
+
+Tracks:
   - New product listings
-  - Price drops / increases
+  - Price drops / increases (lowest unit price across all offers)
   - Restocks / stock drops
   - Out of stock / back in stock
 
-Requires: Qogita account (prices/stock only visible when logged in)
-Deps: pip install playwright requests beautifulsoup4
-      python -m playwright install chromium --with-deps
+Deps: pip install requests
 """
 
 import json
@@ -21,27 +24,24 @@ import re
 import time
 import random
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
-BRAND_URL      = "https://www.qogita.com/brands/maybelline/"
-BASE_URL       = "https://www.qogita.com"
-SNAPSHOT_FILE  = "snapshot_qogita.json"
-REQUEST_DELAY  = 3.0
-RUN_ONCE       = os.getenv("RUN_ONCE", "false").lower() == "true"
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
-HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
+API_BASE        = "https://api.qogita.com"
+BRAND_URL       = "https://www.qogita.com/brands/maybelline/"
+SNAPSHOT_FILE   = "snapshot_qogita.json"
+REQUEST_DELAY   = 1.0   # seconds between API calls (be polite)
+RUN_ONCE        = os.getenv("RUN_ONCE", "false").lower() == "true"
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "900"))  # 30 min
 
-# Qogita login credentials
-QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "YOUR_EMAIL_HERE")
-QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "YOUR_PASSWORD_HERE")
-
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "YOUR_DISCORD_WEBHOOK_HERE")
+QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "")
+QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 # Discord colours
 COLOUR_NEW        = 0xE91E8C
@@ -53,251 +53,276 @@ COLOUR_OOS        = 0x95A5A6
 COLOUR_BACK       = 0x9B59B6
 
 # ---------------------------------------------------------------------------
-# BROWSER
+# AUTH
 # ---------------------------------------------------------------------------
 
-def make_browser(playwright):
-    browser = playwright.chromium.launch(headless=HEADLESS)
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        locale="en-GB",
-        viewport={"width": 1280, "height": 900},
+_token_cache = {"token": None, "expires": 0}
+
+
+def get_token():
+    """Get a valid JWT token, refreshing if needed."""
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["expires"]:
+        return _token_cache["token"]
+
+    print("  Authenticating with Qogita API...")
+    r = requests.post(
+        f"{API_BASE}/auth/login/",
+        json={"email": QOGITA_EMAIL, "password": QOGITA_PASSWORD},
+        timeout=15,
     )
-    return browser, context
+    r.raise_for_status()
+    data = r.json()
+    token = data.get("accessToken") or data.get("access")
+    if not token:
+        raise ValueError(f"No token in response: {data}")
+
+    _token_cache["token"]   = token
+    _token_cache["expires"] = now + 3300  # refresh every 55 mins
+    print("  Authenticated successfully")
+    return token
 
 
-def login(context):
-    """Log in to Qogita. Returns True on success."""
-    print("  Logging in to Qogita...")
-    page = context.new_page()
-    try:
-        page.goto(f"{BASE_URL}/login/", timeout=30000, wait_until="networkidle")
-        time.sleep(2)
+def auth_headers():
+    return {"Authorization": f"Bearer {get_token()}"}
 
-        # Dismiss cookie consent banner if present
-        for selector in ['button:has-text("Accept")', 'button:has-text("Accept all")',
-                         'button:has-text("Allow all")', '[id*="cookie"] button',
-                         '[class*="cookie"] button', '[class*="consent"] button']:
-            try:
-                btn = page.query_selector(selector)
-                if btn and btn.is_visible():
-                    btn.click()
-                    time.sleep(1)
-                    break
-            except Exception:
-                pass
 
-        # Wait for email field
-        page.wait_for_selector('input[type="email"]', timeout=10000)
-        time.sleep(0.5)
+# ---------------------------------------------------------------------------
+# API HELPERS
+# ---------------------------------------------------------------------------
 
-        # Clear and fill fields
-        page.click('input[type="email"]')
-        page.fill('input[type="email"]', QOGITA_EMAIL)
-        time.sleep(0.3)
-        page.click('input[type="password"]')
-        page.fill('input[type="password"]', QOGITA_PASSWORD)
-        time.sleep(0.3)
-
-        # Submit
-        page.click('button[type="submit"]')
-        print(f"  Submitted login form, waiting for redirect...")
-
-        # Wait for navigation away from login page
+def api_get(path, params=None, retries=3):
+    """GET from the Qogita API with auth and retry logic."""
+    url = f"{API_BASE}{path}"
+    for attempt in range(retries):
         try:
-            page.wait_for_url(lambda url: "/login" not in url, timeout=15000)
-        except PWTimeout:
-            # Check current URL anyway
-            pass
-
-        time.sleep(2)
-        current_url = page.url
-        print(f"  Post-login URL: {current_url}")
-
-        if "/login" in current_url:
-            # Try to get error message
-            error_el = page.query_selector('[class*="error"], [class*="alert"], [role="alert"]')
-            error_msg = error_el.inner_text() if error_el else "unknown"
-            print(f"  [!] Login failed — still on login page. Error: {error_msg}")
-            return False
-
-        print(f"  Logged in successfully")
-        return True
-    except Exception as e:
-        print(f"  [!] Login error: {e}")
-        return False
-    finally:
-        page.close()
+            r = requests.get(url, headers=auth_headers(), params=params, timeout=20)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 10))
+                print(f"  [!] Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if r.status_code == 401:
+                # Token expired — force refresh
+                _token_cache["token"] = None
+                r = requests.get(url, headers=auth_headers(), params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"  [!] API error ({path}): {e} — attempt {attempt+1}/{retries}")
+            if attempt < retries - 1:
+                time.sleep(4 * (attempt + 1))
+    return None
 
 
-def fetch_page_html(context, url, wait_selector=None, timeout=25000):
-    """Fetch a page and return HTML content."""
-    page = context.new_page()
-    try:
-        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-        if wait_selector:
-            try:
-                page.wait_for_selector(wait_selector, timeout=10000)
-            except PWTimeout:
-                pass
-        # Extra wait for JS rendering
-        time.sleep(2)
-        return page.content()
-    except Exception as e:
-        print(f"  [!] Fetch error ({url}): {e}")
-        return None
-    finally:
-        page.close()
+def paginate(path, params=None):
+    """Fetch all pages from a paginated API endpoint."""
+    params = params or {}
+    params["page_size"] = 100
+    page = 1
+    all_results = []
+
+    while True:
+        params["page"] = page
+        data = api_get(path, params=params.copy())
+        if not data:
+            break
+
+        results = data.get("results", data if isinstance(data, list) else [])
+        all_results.extend(results)
+
+        # Check for next page
+        if not data.get("next"):
+            break
+        page += 1
+        time.sleep(REQUEST_DELAY)
+
+    return all_results
+
 
 # ---------------------------------------------------------------------------
-# SCRAPING — BRAND LISTING PAGE
+# FETCH MAYBELLINE VARIANTS
 # ---------------------------------------------------------------------------
 
-def scrape_brand_page(context, page_num=1):
-    """Scrape one page of the Maybelline brand listing."""
-    url = f"{BRAND_URL}?page={page_num}" if page_num > 1 else BRAND_URL
-    html = fetch_page_html(context, url, wait_selector="a[href*='/products/']")
-    if not html:
-        return [], False
+def fetch_maybelline_variants_from_page(context):
+    """
+    Scrape the Maybelline brand page to get all product QIDs and slugs.
+    Uses Playwright since the page is SSR (no XHR API call for product listing).
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from bs4 import BeautifulSoup
 
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    seen = set()
-
-    for a in soup.find_all("a", href=re.compile(r"/products/[A-Za-z0-9]+/")):
-        href = a["href"]
-        m = re.search(r"/products/([A-Za-z0-9]+)/([^/?#]+)/?", href)
-        if not m:
-            continue
-        qid  = m.group(1)
-        slug = m.group(2)
-        if qid in seen:
-            continue
-        seen.add(qid)
-
-        # Title from link text or nearby heading
-        title = a.get_text(strip=True)
-        if not title or len(title) < 5:
-            parent = a.find_parent("div") or a.find_parent("li")
-            if parent:
-                h = parent.find(["h2", "h3", "h4", "p"])
-                if h:
-                    title = h.get_text(strip=True)
-
-        full_url = href if href.startswith("http") else BASE_URL + href
-        products.append({
-            "qid":   qid,
-            "slug":  slug,
-            "title": title,
-            "url":   full_url,
-        })
-
-    # Check for next page
-    has_next = bool(soup.find("a", href=re.compile(rf"[?&]page={page_num + 1}")))
-
-    return products, has_next
-
-
-def scrape_all_brand_products(context):
-    """Scrape all pages of the Maybelline brand listing."""
+    print("  Scraping Maybelline brand pages for product list...")
     all_products = []
     page_num = 1
+
     while True:
-        print(f"  Scraping brand page {page_num}...")
-        products, has_next = scrape_brand_page(context, page_num)
-        all_products.extend(products)
-        print(f"    {len(products)} products (total: {len(all_products)})")
-        if not has_next or not products:
+        url = f"{BRAND_URL}?page={page_num}" if page_num > 1 else BRAND_URL
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=25000, wait_until="domcontentloaded")
+            time.sleep(2)
+            html = page.content()
+        except Exception as e:
+            print(f"  [!] Page error ({url}): {e}")
+            page.close()
+            break
+        finally:
+            try: page.close()
+            except: pass
+
+        soup = BeautifulSoup(html, "html.parser")
+        found = set()
+        for a in soup.find_all("a", href=re.compile(r"/products/[A-Za-z0-9]+/")):
+            m = re.search(r"/products/([A-Za-z0-9]+)/([^/?#]+)/?", a["href"])
+            if not m: continue
+            qid, slug = m.group(1), m.group(2)
+            if qid in found: continue
+            found.add(qid)
+            title = a.get_text(strip=True) or slug.replace("-", " ").title()
+            # Get image
+            img = ""
+            parent = a.find_parent("div") or a.find_parent("li")
+            if parent:
+                img_tag = parent.find("img")
+                if img_tag:
+                    src = img_tag.get("src") or img_tag.get("data-src") or ""
+                    if "static.prod.qogita.com" in src:
+                        img = src
+            all_products.append({"qid": qid, "slug": slug, "title": title,
+                                  "url": f"https://www.qogita.com/products/{qid}/{slug}/",
+                                  "image": img})
+
+        print(f"  Page {page_num}: {len(found)} products (total: {len(all_products)})")
+        if not found: break
+
+        # Check for next page link
+        if not soup.find("a", href=re.compile(rf"[?&]page={page_num + 1}")):
             break
         page_num += 1
-        time.sleep(REQUEST_DELAY + random.uniform(0, 2))
+        time.sleep(REQUEST_DELAY + random.uniform(0, 1))
+
     return all_products
 
+
 # ---------------------------------------------------------------------------
-# SCRAPING — PRODUCT DETAIL PAGE
+# FETCH OFFERS FOR A VARIANT
 # ---------------------------------------------------------------------------
 
-def scrape_product(context, product):
+def fetch_variant_detail(qid):
     """
-    Scrape individual product page for:
-    - GTIN / EAN
-    - Lowest unit price
-    - Total stock available
-    - MOV (minimum order value)
-    - Bundle size
-    - Image
+    Fetch variant detail from /variants/{qid}/offers/ which returns:
+    price, inventory, gtin, images, isInStock, sellerCount etc.
+    Thread-safe.
     """
-    url = product["url"]
-    html = fetch_page_html(context, url, wait_selector="table, [class*='offer'], [class*='supplier']")
-    if not html:
-        return product
+    url = f"{API_BASE}/variants/{qid}/offers/"
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=auth_headers(), timeout=15)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 10))
+                time.sleep(wait)
+                continue
+            if r.status_code == 401:
+                _token_cache["token"] = None
+                r = requests.get(url, headers=auth_headers(), timeout=15)
+            if r.status_code in (404, 403):
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
+    return None
 
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
+    offers = data if isinstance(data, list) else data.get("results", [])
 
-    # GTIN / EAN
-    gtin_m = re.search(r"GTIN[:\s]+([0-9]{8,14})", text)
-    product["barcode"] = gtin_m.group(1) if gtin_m else ""
+    parsed = []
+    for o in offers:
+        try:
+            parsed.append({
+                "supplier":   o.get("supplierName") or o.get("supplier") or o.get("sellerName", ""),
+                "unit_price": float(o.get("unitPrice") or o.get("price") or o.get("unit_price", 0)),
+                "mov":        float(o.get("mov") or o.get("minimumOrderValue") or o.get("minimum_order_value", 0)),
+                "stock":      int(o.get("quantity") or o.get("stock") or o.get("availableQuantity", 0)),
+                "bundle":     int(o.get("bundleSize") or o.get("bundle_size") or 1),
+            })
+        except (TypeError, ValueError):
+            continue
 
-    # Image
-    og_img = soup.find("meta", property="og:image")
-    if og_img:
-        product["image"] = og_img.get("content", "")
+    # Sort by lowest unit price, then lowest MOV as tiebreaker
+    return sorted(parsed, key=lambda o: (o["unit_price"], o["mov"]))
 
-    # Title from h1
-    h1 = soup.find("h1")
-    if h1:
-        product["title"] = h1.get_text(strip=True)
 
-    # Parse all supplier offers: SUPPLIER_CODE  £unit_price  £MOV  stock
-    # Format seen on page: "MRGEZY  £4.40  £10,000.00  26,820"
-    offer_pattern = re.compile(
-        r"([A-Z0-9]{5,8})\s+£([\d.]+)\s+£([\d,]+\.[\d]{2})\s+([\d,]+)"
-    )
-    offers = []
-    for m in offer_pattern.finditer(text):
-        offers.append({
-            "supplier":  m.group(1),
-            "unit_price": float(m.group(2)),
-            "mov":        float(m.group(3).replace(",", "")),
-            "stock":      int(m.group(4).replace(",", "")),
-        })
+def parse_variant(item, detail=None):
+    """
+    Build our product dict from the brand page scrape (item)
+    enriched with the variant detail API response (detail).
 
-    if offers:
-        # Pick the supplier with the lowest unit price; break ties by lowest MOV
-        best = sorted(offers, key=lambda o: (o["unit_price"], o["mov"]))[0]
-        product["price"]       = f"{best['unit_price']:.2f}"
-        product["mov"]         = f"{best['mov']:,.2f}"
-        product["stock"]       = best["stock"]
-        product["supplier"]    = best["supplier"]
-        product["in_stock"]    = best["stock"] > 0
-        product["all_offers"]  = len(offers)
-    else:
-        # Fallback: total stock from header
-        stock_m = re.search(r"([\d,]+)\s+available", text)
-        if stock_m:
-            product["stock"]    = int(stock_m.group(1).replace(",", ""))
-            product["in_stock"] = True
-        elif "out of stock" in text.lower():
-            product["stock"]    = 0
-            product["in_stock"] = False
-        else:
-            product.setdefault("stock",    None)
-            product.setdefault("in_stock", True)
+    detail = response from /variants/{qid}/offers/ which returns:
+      price, inventory, gtin, images, isInStock, sellerCount, fid
+    """
+    # QID — from brand page scrape (fid) or detail (fid/qid)
+    qid  = str(item.get("qid") or "")
+    name = item.get("title") or item.get("name") or ""
+    slug = item.get("slug") or ""
 
-    # Bundle size — "Bundles of X" (nearest to chosen supplier)
-    bundle_m = re.search(r"[Bb]undles?\s+of\s+([\d,]+)", text)
-    product["bundle_size"] = bundle_m.group(1).replace(",", "") if bundle_m else ""
+    # Start with what we know from the brand page
+    product = {
+        "qid":        qid,
+        "slug":       slug,
+        "title":      name,
+        "url":        item.get("url") or f"https://www.qogita.com/products/{qid}/{slug}/",
+        "image":      item.get("image") or "",
+        "barcode":    "",
+        "price":      "",
+        "stock":      None,
+        "in_stock":   False,
+        "seller_count": 0,
+    }
+
+    if detail:
+        # Enrich with API detail
+        product["title"]    = detail.get("name") or name
+        product["barcode"]  = str(detail.get("gtin") or "")
+        product["price"]    = str(detail.get("price") or "")
+        product["stock"]    = detail.get("inventory")
+        product["in_stock"] = bool(detail.get("isInStock", False))
+        product["seller_count"] = int(detail.get("sellerCount") or 0)
+
+        # Image from detail (higher quality)
+        images = detail.get("images") or []
+        if images:
+            product["image"] = images[0].get("url") or product["image"]
+
+        # Use fid as the QID if available
+        fid = detail.get("fid") or detail.get("qid")
+        if fid:
+            product["qid"] = str(fid)
+            product["url"] = f"https://www.qogita.com/products/{fid}/{slug}/"
 
     return product
+
 
 # ---------------------------------------------------------------------------
 # PRICING HELPERS
 # ---------------------------------------------------------------------------
+
+def vat_price(price_str):
+    try:
+        return f"{float(price_str) * 1.2:.2f}"
+    except (ValueError, TypeError):
+        return price_str
+
+
+def selleramp_url(barcode, cost_price_str):
+    if not barcode:
+        return None
+    return (
+        f"https://sas.selleramp.com/sas/lookup/"
+        f"?search_term={barcode}&sas_cost_price={vat_price(cost_price_str)}"
+    )
+
 
 def safe_float(val):
     try:
@@ -306,27 +331,17 @@ def safe_float(val):
         return None
 
 
-def selleramp_url(barcode, cost_price_str):
-    if not barcode:
-        return None
-    try:
-        vat = f"{float(cost_price_str) * 1.2:.2f}"
-    except (TypeError, ValueError):
-        vat = cost_price_str
-    return f"https://sas.selleramp.com/sas/lookup/?search_term={barcode}&sas_cost_price={vat}"
-
 # ---------------------------------------------------------------------------
 # DISCORD EMBEDS
 # ---------------------------------------------------------------------------
 
 def _base_fields(product):
-    barcode     = product.get("barcode", "")
-    stock       = product.get("stock")
-    in_stock    = product.get("in_stock", True)
-    mov         = product.get("mov", "")
-    bundle_size = product.get("bundle_size", "")
-    price       = product.get("price", "")
-    sas_url     = selleramp_url(barcode, price)
+    barcode      = product.get("barcode", "")
+    stock        = product.get("stock")
+    in_stock     = product.get("in_stock", True)
+    seller_count = product.get("seller_count", 0)
+    price        = product.get("price", "")
+    sas_url      = selleramp_url(barcode, price)
 
     if stock is not None:
         stock_val = f"**{stock:,} units**"
@@ -335,19 +350,17 @@ def _base_fields(product):
     else:
         stock_val = "❌ Out of stock"
 
-    supplier   = product.get("supplier", "")
-    all_offers = product.get("all_offers", "")
-
     fields = [
-        {"name": "🔢 GTIN / EAN",    "value": f"`{barcode}`" if barcode else "-",              "inline": True},
-        {"name": "📊 Stock (best)",   "value": stock_val,                                        "inline": True},
-        {"name": "📦 Bundle Size",    "value": f"{bundle_size} units" if bundle_size else "-",  "inline": True},
-        {"name": "💳 MOV (best)",     "value": f"£{mov}" if mov else "-",                       "inline": True},
-        {"name": "🏭 Supplier",       "value": f"`{supplier}`" if supplier else "-",            "inline": True},
-        {"name": "📋 Total Offers",   "value": str(all_offers) if all_offers else "-",          "inline": True},
+        {"name": "🔢 GTIN / EAN",   "value": f"`{barcode}`" if barcode else "-",      "inline": True},
+        {"name": "📊 Stock",         "value": stock_val,                                "inline": True},
+        {"name": "🏭 Sellers",       "value": f"{seller_count}" if seller_count else "-", "inline": True},
     ]
     if sas_url:
-        fields.append({"name": "🔍 SellerAmp SAS", "value": f"[Open in SellerAmp]({sas_url})", "inline": False})
+        fields.append({
+            "name":   "🔍 SellerAmp SAS",
+            "value":  f"[Open in SellerAmp]({sas_url})",
+            "inline": False,
+        })
     return fields
 
 
@@ -373,12 +386,13 @@ def _thumbnail(product):
 def notify_new(product):
     price = product.get("price", "")
     fields = [
-        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-", "inline": True},
+        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",   "inline": True},
+        {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
         "title":     f"🆕  NEW LISTING — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "url":       product.get("url", "https://www.qogita.com"),
         "color":     COLOUR_NEW,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -397,14 +411,15 @@ def notify_price_change(product, old_price, new_price, is_drop):
     pct   = f"{abs((new_f - old_f) / old_f * 100):.1f}%" if old_f and new_f else "?"
 
     fields = [
-        {"name": "💰 Old Price", "value": f"£{old_price}",     "inline": True},
-        {"name": "💰 New Price", "value": f"**£{new_price}**", "inline": True},
-        {"name": "📉 Change",    "value": f"{'↓' if is_drop else '↑'} {diff} ({pct})", "inline": True},
+        {"name": "💰 Old Price", "value": f"£{old_price}",                                          "inline": True},
+        {"name": "💰 New Price", "value": f"**£{new_price}**",                                      "inline": True},
+        {"name": "📉 Change",    "value": f"{'↓' if is_drop else '↑'} {diff} ({pct})",              "inline": True},
+        {"name": "💷 New Price (inc. VAT)", "value": f"£{vat_price(new_price)}" if new_price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
         "title":     f"{'💰  PRICE DROP' if is_drop else '📈  PRICE INCREASE'} — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "url":       product.get("url", "https://www.qogita.com"),
         "color":     COLOUR_PRICE_DROP if is_drop else COLOUR_PRICE_UP,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -417,16 +432,19 @@ def notify_price_change(product, old_price, new_price, is_drop):
 
 
 def notify_stock_change(product, old_stock, new_stock, is_restock):
-    diff = abs(new_stock - old_stock) if (new_stock is not None and old_stock is not None) else "?"
+    price = product.get("price", "")
+    diff  = abs(new_stock - old_stock) if (new_stock is not None and old_stock is not None) else "?"
     fields = [
-        {"name": "📊 Old Stock", "value": f"{old_stock:,} units" if isinstance(old_stock, int) else str(old_stock), "inline": True},
-        {"name": "📊 New Stock", "value": f"**{new_stock:,} units**" if isinstance(new_stock, int) else str(new_stock), "inline": True},
-        {"name": "📉 Change",    "value": f"{'↑ +' if is_restock else '↓ -'}{diff:,}" if isinstance(diff, int) else str(diff), "inline": True},
+        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",        "inline": True},
+        {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
+        {"name": "📊 Old Stock", "value": f"{old_stock:,} units" if isinstance(old_stock, int) else "-", "inline": True},
+        {"name": "📊 New Stock", "value": f"**{new_stock:,} units**" if isinstance(new_stock, int) else "-", "inline": True},
+        {"name": "📉 Change",    "value": f"{'↑ +' if is_restock else '↓ -'}{diff:,}" if isinstance(diff, int) else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
         "title":     f"{'🟢  RESTOCK' if is_restock else '📉  STOCK DROP'} — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "url":       product.get("url", "https://www.qogita.com"),
         "color":     COLOUR_RESTOCK if is_restock else COLOUR_LOW_STOCK,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -435,13 +453,12 @@ def notify_stock_change(product, old_stock, new_stock, is_restock):
     t = _thumbnail(product)
     if t: embed["thumbnail"] = t
     _send_embed(embed)
-    print(f"  Discord: {'RESTOCK' if is_restock else 'STOCK DROP'} — {product.get('title', '')[:50]}")
 
 
 def notify_oos(product):
     embed = {
         "title":     f"🔴  OUT OF STOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "url":       product.get("url", "https://www.qogita.com"),
         "color":     COLOUR_OOS,
         "fields":    _base_fields(product),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -456,12 +473,13 @@ def notify_oos(product):
 def notify_back_in_stock(product):
     price = product.get("price", "")
     fields = [
-        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-", "inline": True},
+        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",       "inline": True},
+        {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
         "title":     f"🟢  BACK IN STOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "url":       product.get("url", "https://www.qogita.com"),
         "color":     COLOUR_BACK,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -471,6 +489,7 @@ def notify_back_in_stock(product):
     if t: embed["thumbnail"] = t
     _send_embed(embed)
     print(f"  Discord: BACK IN STOCK — {product.get('title', '')[:60]}")
+
 
 # ---------------------------------------------------------------------------
 # SNAPSHOT
@@ -497,13 +516,11 @@ def snapshot_entry(product):
         "price":       product.get("price", ""),
         "stock":       product.get("stock"),
         "in_stock":    product.get("in_stock", True),
-        "mov":         product.get("mov", ""),
-        "bundle_size": product.get("bundle_size", ""),
-        "supplier":    product.get("supplier", ""),
-        "all_offers":  product.get("all_offers", ""),
+        "seller_count": product.get("seller_count", 0),
         "first_seen":  product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
+
 
 # ---------------------------------------------------------------------------
 # CHANGE DETECTION
@@ -517,8 +534,7 @@ def check_changes(product, old):
     was_in_stock = old.get("in_stock", True)
     now_in_stock = product.get("in_stock", True)
 
-    # Fill cached fields if scrape missed them
-    for key in ("image", "barcode", "bundle_size", "mov"):
+    for key in ("image", "barcode"):
         if not product.get(key):
             product[key] = old.get(key, "")
 
@@ -529,8 +545,8 @@ def check_changes(product, old):
         notify_back_in_stock(product)
         time.sleep(1)
     elif was_in_stock and not now_in_stock:
-        notify_oos(product)
-        time.sleep(1)
+        # Silently record OOS — no Discord alert
+        pass
     elif old_f and new_f and new_f < old_f - 0.01:
         notify_price_change(product, old_price, new_price, is_drop=True)
         time.sleep(1)
@@ -539,7 +555,6 @@ def check_changes(product, old):
         time.sleep(1)
 
     if old_stock is not None and new_stock is not None and now_in_stock:
-        # Use 5% threshold to avoid noise from minor stock fluctuations
         threshold = max(50, int(old_stock * 0.05))
         if new_stock > old_stock + threshold:
             notify_stock_change(product, old_stock, new_stock, is_restock=True)
@@ -548,6 +563,7 @@ def check_changes(product, old):
             notify_stock_change(product, old_stock, new_stock, is_restock=False)
             time.sleep(1)
 
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
@@ -555,76 +571,118 @@ def check_changes(product, old):
 def run_check():
     print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Checking Qogita Maybelline...")
 
+    snapshot     = load_snapshot()
+    known_qids   = set(snapshot.keys())
+    # Use a flag file to mark baseline as complete — avoids re-alerting
+    # if snapshot partially saved on first run
+    baseline_done = os.path.exists("baseline_done.txt")
+    is_first_run  = not baseline_done
+
+    # 1. Scrape brand page for product list (SSR, needs browser)
+    #    Then use API for offers per product (needs auth token)
     with sync_playwright() as pw:
-        browser, context = make_browser(pw)
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
         try:
-            # Login first
-            if not login(context):
-                print("  [!] Cannot proceed without login")
-                return
-
-            snapshot     = load_snapshot()
-            known_qids   = set(snapshot.keys())
-            is_first_run = len(known_qids) == 0
-
-            # Scrape all brand listing pages
-            print("  Scraping Maybelline brand pages...")
-            all_products = scrape_all_brand_products(context)
-            if not all_products:
-                print("  [!] No products found")
-                return
-
-            current_qids = {p["qid"] for p in all_products}
-            new_qids     = current_qids - known_qids
-            print(f"  {len(all_products)} products total, {len(new_qids)} new")
-
-            for i, product in enumerate(all_products, 1):
-                qid = product["qid"]
-                print(f"  [{i}/{len(all_products)}] {product['title'][:55]}")
-                time.sleep(REQUEST_DELAY + random.uniform(0, 2))
-
-                # Scrape product detail for price/stock/GTIN
-                product = scrape_product(context, product)
-
-                if is_first_run:
-                    # Silent baseline — no alerts
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                    snapshot[qid] = entry
-                elif qid in new_qids:
-                    notify_new(product)
-                    time.sleep(1.5)
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                    snapshot[qid] = entry
-                else:
-                    old = snapshot[qid]
-                    check_changes(product, old)
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = old.get("first_seen", entry["first_seen"])
-                    snapshot[qid] = entry
-
-                # Auto-save every 20 products
-                if i % 20 == 0:
-                    save_snapshot(snapshot)
-                    print(f"  Auto-saved at {i}/{len(all_products)}")
-
-            save_snapshot(snapshot)
-            if is_first_run:
-                print(f"  Baseline complete — {len(snapshot)} products. No alerts sent.")
-            else:
-                print(f"  Snapshot saved ({len(snapshot)} products tracked)")
-
+            variants = fetch_maybelline_variants_from_page(context)
         finally:
             browser.close()
+
+    if not variants:
+        print("  [!] No variants found on brand page")
+        return
+
+    current_qids = {str(v.get("qid") or v.get("id", "")) for v in variants}
+    new_qids     = current_qids - known_qids
+    print(f"  {len(variants)} variants, {len(new_qids)} new")
+
+    # 2. Fetch all offers in parallel (10 concurrent workers)
+    print(f"  Fetching offers for {len(variants)} products (10 parallel workers)...")
+
+    def fetch_and_parse(item):
+        qid = str(item.get("qid") or "")
+        if not qid:
+            return None
+        detail = fetch_variant_detail(qid)
+        # If API returns None (404/error), skip this product entirely
+        # rather than recording it as OOS
+        if detail is None:
+            return None
+        product = parse_variant(item, detail)
+        return product
+
+    products_with_offers = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_and_parse, item): item for item in variants}
+        for future in as_completed(futures):
+            try:
+                product = future.result()
+                if product:
+                    products_with_offers.append(product)
+            except Exception as e:
+                print(f"  [!] Error fetching offers: {e}")
+            completed += 1
+            if completed % 100 == 0:
+                print(f"  [{completed}/{len(variants)}] offers fetched...")
+                save_snapshot(snapshot)
+
+    print(f"  All offers fetched — processing {len(products_with_offers)} products...")
+
+    # 3. Process results
+    for product in products_with_offers:
+        qid = product.get("qid", "")
+        if not qid:
+            continue
+
+        if is_first_run:
+            entry = snapshot_entry(product)
+            entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+            snapshot[qid] = entry
+        elif qid in new_qids:
+            # Skip new listing alert if product is out of stock
+            if not product.get("in_stock") or not product.get("stock"):
+                pass
+            else:
+                print(f"  -> NEW: {product['title'][:60]}")
+                notify_new(product)
+                time.sleep(1.5)
+            entry = snapshot_entry(product)
+            entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+            snapshot[qid] = entry
+        else:
+            check_changes(product, snapshot[qid])
+            entry = snapshot_entry(product)
+            entry["first_seen"] = snapshot[qid].get("first_seen", entry["first_seen"])
+            snapshot[qid] = entry
+
+    save_snapshot(snapshot)
+    if is_first_run:
+        # Mark baseline as done so subsequent runs fire alerts
+        with open("baseline_done.txt", "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+        print(f"  Baseline complete — {len(snapshot)} products. No alerts sent.")
+    else:
+        print(f"  Done — {len(snapshot)} products tracked")
 
 
 def main():
     print("=" * 55)
-    print("  Qogita Maybelline Monitor")
-    print(f"  Watching: {BRAND_URL}")
+    print("  Qogita Maybelline Monitor (API-based)")
+    print(f"  Brand: {BRAND_URL}")
     print("  Tracking: new listings, price drops, restocks")
     print("=" * 55)
+
+    if not QOGITA_EMAIL or not QOGITA_PASSWORD:
+        print("  [!] QOGITA_EMAIL and QOGITA_PASSWORD must be set")
+        return
+    if not DISCORD_WEBHOOK:
+        print("  [!] DISCORD_WEBHOOK must be set")
+        return
 
     if RUN_ONCE:
         run_check()
