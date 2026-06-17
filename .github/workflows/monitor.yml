@@ -2,7 +2,7 @@ name: Qogita Maybelline Monitor
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # every 30 minutes
+    - cron: "*/15 * * * *"  # every 15 minutes
   workflow_dispatch:
 
 env:
@@ -14,7 +14,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -28,7 +28,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install playwright requests beautifulsoup4
+        run: pip install requests playwright beautifulsoup4
 
       - name: Install Playwright browsers
         run: python -m playwright install chromium --with-deps
@@ -39,7 +39,6 @@ jobs:
           QOGITA_EMAIL:    ${{ secrets.QOGITA_EMAIL }}
           QOGITA_PASSWORD: ${{ secrets.QOGITA_PASSWORD }}
           RUN_ONCE: "true"
-          HEADLESS: "true"
         run: python qogita_monitor.py
 
       - name: Commit updated snapshot
@@ -47,6 +46,6 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin main
-          git add snapshot_qogita.json 2>/dev/null || true
+          git add snapshot_qogita.json baseline_done.txt 2>/dev/null || true
           git diff --cached --quiet || git commit -m "chore: update qogita snapshot [skip ci]"
           git push origin HEAD:main
