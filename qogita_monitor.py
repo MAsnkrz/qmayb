@@ -38,10 +38,10 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
 HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
 
 # Qogita login credentials
-QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "dapaplays@gmail.com")
-QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "Sufsat-gucqum-5detse")
+QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "YOUR_EMAIL_HERE")
+QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "YOUR_PASSWORD_HERE")
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1516449009055825992/bR6nty2UhaUJ67kBv3OZaifmQFg665oApOIj-Wnj-TjrFzMTEkKIfkEk0Yhex1PsdQC1")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "YOUR_DISCORD_WEBHOOK_HERE")
 
 # Discord colours
 COLOUR_NEW        = 0xE91E8C
