@@ -101,28 +101,43 @@ def _safe_int(val):
         return None
 
 
-def fetch_brand_catalog(brand_name):
+def fetch_brand_catalog(brand_name, retries=4):
     """
     Fetch the full brand catalogue in one request via the CSV download
-    endpoint. Returns a list of parsed product dicts, or [] on failure.
-    """
-    r = requests.get(
-        f"{API_BASE}/variants/search/download/",
-        headers=auth_headers(),
-        params={"brand_name": brand_name},
-        timeout=60,
-    )
-    if r.status_code == 401:
-        _token_cache["token"] = None
-        r = requests.get(
-            f"{API_BASE}/variants/search/download/",
-            headers=auth_headers(),
-            params={"brand_name": brand_name},
-            timeout=60,
-        )
-    r.raise_for_status()
+    endpoint. Returns a list of parsed product dicts, or [] on failure
+    (including if the endpoint is still rate limited after retrying).
 
-    text = r.content.decode("utf-8", errors="replace")
+    This endpoint generates a full CSV server-side on every call and
+    appears to carry a stricter rate limit than other Qogita endpoints —
+    we respect Retry-After and back off rather than crashing the job.
+    """
+    url = f"{API_BASE}/variants/search/download/"
+    last_status = None
+
+    for attempt in range(retries):
+        r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+        last_status = r.status_code
+
+        if r.status_code == 401:
+            _token_cache["token"] = None
+            r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+            last_status = r.status_code
+
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 30 * (attempt + 1)))
+            print(f"  [!] Rate limited (429) on catalog download — waiting {wait}s (attempt {attempt+1}/{retries})")
+            time.sleep(wait)
+            continue
+
+        if not r.ok:
+            print(f"  [!] Catalog download failed: HTTP {r.status_code}")
+            return None  # request failure — distinct from a genuinely empty result
+
+        text = r.content.decode("utf-8", errors="replace")
+        break
+    else:
+        print(f"  [!] Catalog download still rate limited after {retries} attempts (last status {last_status}) — skipping this run")
+        return None  # request failure — do not try fallback brand names on this
     reader = csv.DictReader(io.StringIO(text))
 
     products = []
@@ -159,16 +174,29 @@ def fetch_brand_catalog(brand_name):
 
 
 def fetch_brand_catalog_with_fallback():
-    """Try the confirmed brand name first, then fall back to alternates."""
+    """
+    Try the confirmed brand name first. Only fall back to alternate
+    spellings if the call genuinely succeeded but returned zero rows
+    (wrong name) — NOT if the call failed/was rate limited (None),
+    since retrying with different names during a rate-limit window
+    would just make things worse.
+    """
     print(f"  Fetching catalog for brand_name='{BRAND_NAME}'...")
     products = fetch_brand_catalog(BRAND_NAME)
+
+    if products is None:
+        print("  [!] Request failed/rate limited — not trying fallback names this run")
+        return []
     if products:
         print(f"  Got {len(products)} products")
         return products
 
     for alt in BRAND_NAME_FALLBACKS:
-        print(f"  No results — trying brand_name='{alt}'...")
+        print(f"  No results for '{BRAND_NAME}' — trying brand_name='{alt}'...")
         products = fetch_brand_catalog(alt)
+        if products is None:
+            print("  [!] Request failed/rate limited on fallback — stopping fallback attempts this run")
+            return []
         if products:
             print(f"  Got {len(products)} products with '{alt}'")
             return products
