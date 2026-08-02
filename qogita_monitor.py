@@ -103,56 +103,144 @@ def _safe_int(val):
 
 def fetch_brand_catalog(brand_name, retries=4):
     """
-    Fetch the full brand catalogue in one request via the CSV download
-    endpoint. Returns a list of parsed product dicts, or [] on failure
-    (including if the endpoint is still rate limited after retrying).
-
-    This endpoint generates a full CSV server-side on every call and
-    appears to carry a stricter rate limit than other Qogita endpoints —
-    we respect Retry-After and back off rather than crashing the job.
+    Fetch brand catalogue via the async catalog download endpoint.
+    POST /public/buyers/catalog-downloads/ with brand_names filter.
+    Uses webhook.site as a free temporary receiver — no webhook infra needed.
+    Returns list of parsed product dicts, or [] on failure.
     """
-    url = f"{API_BASE}/variants/search/download/"
-    last_status = None
+    import csv, io
 
-    for attempt in range(retries):
-        r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
-        last_status = r.status_code
+    # Step 1: Create a free temporary webhook.site receiver
+    try:
+        ws = requests.post(
+            "https://webhook.site/token",
+            json={"default_status": 200, "default_content": "OK", "timeout": 0},
+            timeout=15,
+        )
+        ws.raise_for_status()
+        token_uuid  = ws.json()["uuid"]
+        webhook_url = f"https://webhook.site/{token_uuid}"
+    except Exception as e:
+        print(f"  [!] webhook.site error: {e}")
+        return None
 
-        if r.status_code == 401:
-            _token_cache["token"] = None
-            r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
-            last_status = r.status_code
+    # Step 2: Trigger async catalog download
+    try:
+        r = requests.post(
+            f"{API_BASE}/public/buyers/catalog-downloads/",
+            headers=auth_headers(),
+            json={"brand_names": [brand_name], "webhookUrl": webhook_url},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  [!] Catalog download trigger error: {e}")
+        return None
 
-        if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", 30 * (attempt + 1)))
-            print(f"  [!] Rate limited (429) on catalog download — waiting {wait}s (attempt {attempt+1}/{retries})")
-            time.sleep(wait)
+    if r.status_code == 401:
+        _token_cache["token"] = None
+        try:
+            r = requests.post(
+                f"{API_BASE}/public/buyers/catalog-downloads/",
+                headers=auth_headers(),
+                json={"brand_names": [brand_name], "webhookUrl": webhook_url},
+                timeout=15,
+            )
+        except Exception as e:
+            return None
+
+    if r.status_code == 429:
+        wait = int(r.headers.get("Retry-After", 60))
+        print(f"  [!] Rate limited — waiting {wait}s")
+        time.sleep(wait)
+        return None
+
+    if not r.ok:
+        print(f"  [!] Catalog trigger failed: HTTP {r.status_code} — {r.text[:200]}")
+        return None
+
+    correlation_id = r.json().get("catalogRequestId", "unknown")
+    print(f"  Catalog generation started (ID: {correlation_id}) — polling for result...")
+
+    # Step 3: Poll webhook.site until Qogita delivers the download link
+    download_url = None
+    max_attempts = 40  # 40 × 30s = 20 minutes max
+    for attempt in range(max_attempts):
+        time.sleep(30)
+        elapsed = (attempt + 1) * 30
+        print(f"  [{elapsed}s] Polling webhook.site...", end=" ", flush=True)
+
+        try:
+            poll = requests.get(
+                f"https://webhook.site/token/{token_uuid}/requests",
+                params={"page": 1, "sorting": "newest"},
+                timeout=15,
+            )
+            poll.raise_for_status()
+            requests_list = poll.json().get("data", [])
+        except Exception as e:
+            print(f"poll error: {e}")
             continue
 
-        if not r.ok:
-            print(f"  [!] Catalog download failed: HTTP {r.status_code}")
-            return None  # request failure — distinct from a genuinely empty result
+        if not requests_list:
+            print("no callback yet")
+            continue
 
-        text = r.content.decode("utf-8", errors="replace")
-        break
-    else:
-        print(f"  [!] Catalog download still rate limited after {retries} attempts (last status {last_status}) — skipping this run")
-        return None  # request failure — do not try fallback brand names on this
+        latest  = requests_list[0]
+        raw_body = latest.get("content", "") or ""
+        try:
+            payload = json.loads(raw_body)
+        except Exception:
+            print(f"non-JSON response")
+            continue
+
+        event_type = payload.get("event_type") or payload.get("type") or ""
+        print(f"event: {event_type}")
+
+        if "completed" in event_type.lower():
+            download_url = (
+                payload.get("data", {}).get("download_url") or
+                payload.get("downloadUrl") or
+                payload.get("url") or
+                payload.get("file_url")
+            )
+            if download_url:
+                break
+            print(f"  No download_url in payload keys: {list(payload.keys())}")
+        elif "failed" in event_type.lower():
+            print(f"  [!] Catalog generation failed: {raw_body[:200]}")
+            return []
+
+    if not download_url:
+        print(f"  [!] Timed out waiting for catalog delivery")
+        return None
+
+    # Step 4: Download the CSV
+    print(f"  Downloading catalog CSV...")
+    try:
+        csv_resp = requests.get(download_url, timeout=120)
+        csv_resp.raise_for_status()
+        content_bytes = csv_resp.content
+        import gzip
+        if "gzip" in csv_resp.headers.get("Content-Type", "") or download_url.endswith(".gz"):
+            content_bytes = gzip.decompress(content_bytes)
+        text = content_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"  [!] CSV download error: {e}")
+        return None
+
+    # Step 5: Parse the CSV
     reader = csv.DictReader(io.StringIO(text))
-
     products = []
     for row in reader:
-        product_url = row.get("Product URL", "") or ""
+        product_url    = row.get("Product URL", "") or ""
         qid_m = re.search(r"/products/([A-Za-z0-9]+)/", product_url)
-        gtin  = (row.get("GTIN", "") or "").strip()
-        qid   = qid_m.group(1) if qid_m else gtin
+        gtin   = (row.get("GTIN", "") or "").strip()
+        qid    = qid_m.group(1) if qid_m else gtin
 
         cheapest_stock = _safe_int(row.get("Lowest Priced Offer Inventory", ""))
         total_stock    = _safe_int(row.get("Total Inventory of All Offers", ""))
         num_offers     = _safe_int(row.get("Number of Offers", "")) or 0
-
-        # In-stock = any inventory exists across any offer
-        in_stock = (total_stock or 0) > 0
+        in_stock       = (total_stock or 0) > 0
 
         products.append({
             "qid":            qid,
@@ -160,7 +248,8 @@ def fetch_brand_catalog(brand_name, retries=4):
             "url":            product_url or f"https://www.qogita.com/products/{qid}/",
             "image":          row.get("Image URL", "") or "",
             "barcode":        gtin,
-            "price":          (row.get("£ Lowest Price inc. shipping", "") or "").strip(),
+            "price":          (row.get("\u00a3 Lowest Price inc. shipping", "") or
+                               row.get("Lowest Price", "") or "").strip(),
             "bundle_size":    (row.get("Unit", "") or "").strip(),
             "cheapest_stock": cheapest_stock,
             "stock":          total_stock,
@@ -170,6 +259,7 @@ def fetch_brand_catalog(brand_name, retries=4):
             "in_stock":       in_stock,
         })
 
+    print(f"  Parsed {len(products)} products from catalog")
     return products
 
 
